@@ -1,6 +1,7 @@
 import pynecone as pc
 from pynecone.base import Base
 from langchain import LLMChain
+from langchain.chains import ConversationChain, LLMChain
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts.chat import (
     ChatPromptTemplate,
@@ -14,27 +15,132 @@ import os
 from datetime import datetime
 os.environ["OPENAI_API_KEY"] = ""
 
-chat = ChatOpenAI(temperature=0.8,
+BUG_STEP1_PROMPT_TEMPLATE = "./bug_analyze.txt"
+BUG_STEP2_PROMPT_TEMPLATE = "./bug_solution.txt"
+ENHANCE_STEP1_PROMPT_TEMPLATE = "./enhancement_say_thanks.txt"
+INTENT_LIST_TXT = "./intent_list.txt"
+
+DATA_KAKAO_SINK = "./project_data_카카오싱크.txt"
+DATA_KAKAO_SOCIAL = "./project_data_카카오소셜.txt"
+DATA_KAKAO_TALK_CAHNNEL = "./project_data_카카오톡채널.txt"
+INTENT_PROMPT_TEMPLATE = "./parse_intent.txt"
+
+
+
+def read_prompt_template(file_path: str) -> str:
+    with open(file_path, "r") as f:
+        prompt_template = f.read()
+
+    return prompt_template
+
+def create_chain(llm, template_path, output_key):
+    return LLMChain(
+        llm=llm,
+        prompt=ChatPromptTemplate.from_template(
+            template=read_prompt_template(template_path)
+        ),
+        output_key=output_key,
+        verbose=True,
+    )
+
+
+llm = ChatOpenAI(temperature=0.8,
                   model_name='gpt-3.5-turbo-16k',
                   max_tokens=1024)
+bug_step1_chain = create_chain(
+    llm=llm,
+    template_path=BUG_STEP1_PROMPT_TEMPLATE,
+    output_key="bug_analysis",
+)
+bug_step2_chain = create_chain(
+    llm=llm,
+    template_path=BUG_STEP2_PROMPT_TEMPLATE,
+    output_key="output",
+)
+enhance_step1_chain = create_chain(
+    llm=llm,
+    template_path=ENHANCE_STEP1_PROMPT_TEMPLATE,
+    output_key="output",
+)
+parse_intent_chain = create_chain(
+    llm=llm,
+    template_path=INTENT_PROMPT_TEMPLATE,
+    output_key="intent",
+)
 
-content = open('./project_data_카카오싱크.txt', 'r').read()
+default_chain = ConversationChain(llm=llm, output_key="output")
 
-system_message = f"""assistant는 카카오 API를 설명하는 챗봇으로서 동작한다. 
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
 
-{content}
+CHROMA_PERSIST_DIR = "./chroma"
+CHROMA_COLLECTION_NAME = "kakao-bot"
 
-카카오 싱크 내용을 참고하여 사용법의 설명문을 작성해라 줄바꿈을 통해 가독성이 높게 출력해주세요.
+_db = Chroma(
+    persist_directory=CHROMA_PERSIST_DIR,
+    embedding_function=OpenAIEmbeddings(),
+    collection_name=CHROMA_COLLECTION_NAME,
+)
+_retriever = _db.as_retriever()
 
-"""
-system_message_prompt = SystemMessage(content=system_message)
+def query_db(query: str, use_retriever: bool = False) -> list[str]:
+    if use_retriever:
+        docs = _retriever.get_relevant_documents(query)
+    else:
+        docs = _db.similarity_search(query)
 
-human_template = ("{question}")
+    str_docs = [doc.page_content for doc in docs]
+    return str_docs
 
-human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
-chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
+def gernerate_answer(user_message) -> str:
+    context = dict(user_message=user_message)
+    context["input"] = f"""{context["user_message"]}
+    \n
+    {read_prompt_template(DATA_KAKAO_SINK)}\n
+    {read_prompt_template(DATA_KAKAO_SOCIAL)}\n
+    {read_prompt_template(DATA_KAKAO_TALK_CAHNNEL)}"
+    """
+    context["intent_list"] = read_prompt_template(INTENT_LIST_TXT)
+    
+    print("*"*200)
+    print(context)
+    print("*"*200)
 
-chain = LLMChain(llm=chat, prompt=chat_prompt)
+    # intent = parse_intent_chain(context)["intent"]
+    intent = parse_intent_chain.run(context)
+
+    if intent == "bug":
+        context["related_documents"] = query_db(context["user_message"])
+
+        answer = ""
+        for step in [bug_step1_chain, bug_step2_chain]:
+            context = step(context)
+            answer += context[step.output_key]
+            answer += "\n\n"
+    elif intent == "enhancement":
+        answer = enhance_step1_chain.run(context)
+    else:
+        answer = default_chain.run(context["user_message"])
+
+    return answer
+
+# content = open('./project_data_카카오싱크.txt', 'r').read()
+
+# system_message = f"""assistant는 카카오 API를 설명하는 챗봇으로서 동작한다. 
+
+# {content}
+
+# 카카오 싱크 내용을 참고하여 사용법의 설명문을 작성해라 줄바꿈을 통해 가독성이 높게 출력해주세요.
+
+# """
+# system_message_prompt = SystemMessage(content=system_message)
+
+# human_template = ("{question}")
+
+# human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
+# chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
+
+# chain = LLMChain(llm=llm, prompt=chat_prompt)
 
 class Message(Base):
     original_text: str
@@ -57,7 +163,7 @@ class State(pc.State):
         self.messages = self.messages + [
             Message(
                 original_text=self.question,
-                text=chain.run(question=self.question),
+                text=gernerate_answer(self.question),
                 created_at=datetime.now().strftime("%B %d, %Y %I:%M %p"),
             )
         ]
